@@ -34,18 +34,36 @@ const (
     healthCheckURL  = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
-// Supported methods (from go-shadowsocks2)
+// cipherNameMap translates common Shadowsocks method names to those expected by go-shadowsocks2.
+var cipherNameMap = map[string]string{
+    "aes-128-cfb":              "AES-128-CFB",
+    "aes-192-cfb":              "AES-192-CFB",
+    "aes-256-cfb":              "AES-256-CFB",
+    "aes-128-ctr":              "AES-128-CTR",
+    "aes-192-ctr":              "AES-192-CTR",
+    "aes-256-ctr":              "AES-256-CTR",
+    "aes-128-gcm":              "AEAD_AES_128_GCM",
+    "aes-192-gcm":              "AEAD_AES_192_GCM",
+    "aes-256-gcm":              "AEAD_AES_256_GCM",
+    "chacha20-ietf-poly1305":   "AEAD_CHACHA20_POLY1305",
+    "chacha20-poly1305":        "AEAD_CHACHA20_POLY1305",
+    "chacha20":                 "CHACHA20",
+    "rc4-md5":                  "RC4-MD5",
+    "salsa20":                  "SALSA20",
+}
+
+// supportedMethods are the keys we accept from the proxy list.
 var supportedMethods = map[string]bool{
     "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
     "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
     "aes-128-gcm": true, "aes-192-gcm": true, "aes-256-gcm": true,
-    "chacha20-ietf-poly1305": true, "rc4-md5": true,
-    "chacha20": true, "salsa20": true,
+    "chacha20-ietf-poly1305": true, "chacha20-poly1305": true,
+    "rc4-md5": true, "chacha20": true, "salsa20": true,
 }
 
 // ========== STRUCTS ==========
 type ProxyConfig struct {
-    Method   string
+    Method   string // original method from list
     Password string
     Server   string
     Port     string
@@ -200,7 +218,13 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
-    cipher, err := ss.PickCipher(cfg.Method, nil, cfg.Password)
+    // Map the method name to what go-shadowsocks2 expects
+    mappedMethod, ok := cipherNameMap[cfg.Method]
+    if !ok {
+        return nil, fmt.Errorf("no mapping for cipher %s", cfg.Method)
+    }
+
+    cipher, err := ss.PickCipher(mappedMethod, nil, cfg.Password)
     if err != nil {
         return nil, fmt.Errorf("cipher error: %w", err)
     }
@@ -218,8 +242,8 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
             if err != nil {
                 return
             }
-            // Pass the method string as well for the Dial call
-            go handleSOCKS5(conn, remoteAddr, cfg.Method, cipher)
+            // Pass the mapped method string as well for the Dial call
+            go handleSOCKS5(conn, remoteAddr, mappedMethod, cipher)
         }
     }()
 

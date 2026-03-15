@@ -18,6 +18,8 @@ import (
     "sync/atomic"
     "time"
 
+    // Blank import to ensure all ciphers are registered
+    _ "github.com/shadowsocks/go-shadowsocks2/cipher"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
     "github.com/shadowsocks/go-shadowsocks2/socks"
 )
@@ -223,6 +225,9 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
     if !ok {
         return nil, fmt.Errorf("no mapping for cipher %s", cfg.Method)
     }
+
+    // Log the mapped name for debugging
+    log.Printf("Attempting cipher: original=%s mapped=%s", cfg.Method, mappedMethod)
 
     cipher, err := ss.PickCipher(mappedMethod, nil, cfg.Password)
     if err != nil {

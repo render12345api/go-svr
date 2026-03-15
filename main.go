@@ -34,7 +34,7 @@ const (
     localSocksPort  = 1080
 )
 
-// Supported encryption methods (from go-shadowsocks2)
+// Supported encryption methods
 var supportedMethods = map[string]bool{
     "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
     "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
@@ -190,7 +190,6 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
-    // Create cipher
     cipher, err := ss.PickCipher(cfg.Method, nil, cfg.Password)
     if err != nil {
         return nil, fmt.Errorf("cipher error: %w", err)
@@ -219,18 +218,15 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
 
 func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
     defer client.Close()
-    // SOCKS5 handshake
     target, err := socks.Handshake(client)
     if err != nil {
         return
     }
-    // Connect to remote Shadowsocks server using the correct Dial signature
     remote, err := ss.Dial(remoteAddr, cipher)
     if err != nil {
         return
     }
     defer remote.Close()
-    // Relay traffic
     go func() {
         io.Copy(remote, client)
         if tcpConn, ok := remote.(*net.TCPConn); ok {
@@ -273,7 +269,6 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
         }
     }()
 
-    // Create rotator with default config
     cfg := lashes.DefaultConfig()
     cfg.Strategy = lashes.RoundRobinStrategy
     cfg.HealthCheck = &lashes.HealthCheckConfig{
@@ -287,14 +282,12 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
         return nil, err
     }
 
-    // Add proxies
     for _, p := range proxyURLs {
         if err := rot.Add(ctx, p, lashes.SOCKS5); err != nil {
             log.Printf("Failed to add proxy %s: %v", p, err)
         }
     }
 
-    // Start health checks
     go rot.HealthCheck(ctx, cfg.HealthCheck)
 
     return rot, nil
@@ -444,7 +437,7 @@ func main() {
         defer ticker.Stop()
         for {
             select {
-            <-ctx.Done():
+            case <-ctx.Done():
                 return
             case <-ticker.C:
                 log.Println("Refreshing proxy list...")

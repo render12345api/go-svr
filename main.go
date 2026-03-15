@@ -18,9 +18,11 @@ import (
     "sync/atomic"
     "time"
 
-    // Only these two imports are needed – they register all ciphers
+    // Register all ciphers (these packages exist in the latest commit)
+    _ "github.com/shadowsocks/go-shadowsocks2/aead"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
     "github.com/shadowsocks/go-shadowsocks2/socks"
+    _ "github.com/shadowsocks/go-shadowsocks2/stream"
 )
 
 // ========== CONFIG ==========

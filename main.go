@@ -87,7 +87,7 @@ var (
     webClientsLock sync.Mutex
 )
 
-// ========== PROXY PARSING (same as before) ==========
+// ========== PROXY PARSING ==========
 func decodeBase64Safe(s string) (string, error) {
     if l := len(s) % 4; l > 0 {
         s += strings.Repeat("=", 4-l)
@@ -218,7 +218,8 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
             if err != nil {
                 return
             }
-            go handleSOCKS5(conn, remoteAddr, cipher)
+            // Pass the method string as well for the Dial call
+            go handleSOCKS5(conn, remoteAddr, cfg.Method, cipher)
         }
     }()
 
@@ -226,17 +227,20 @@ func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
     return func() { ln.Close() }, nil
 }
 
-func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
+func handleSOCKS5(client net.Conn, remoteAddr, method string, cipher ss.Cipher) {
     defer client.Close()
-    target, err := socks.Handshake(client)
+    // Perform SOCKS5 handshake, ignore the target address
+    _, err := socks.Handshake(client)
     if err != nil {
         return
     }
-    remote, err := ss.Dial(remoteAddr, cipher)
+    // Connect to remote Shadowsocks server using the correct Dial signature
+    remote, err := ss.Dial(remoteAddr, method, cipher)
     if err != nil {
         return
     }
     defer remote.Close()
+    // Relay traffic
     go func() {
         io.Copy(remote, client)
         if tcpConn, ok := remote.(*net.TCPConn); ok {
@@ -319,10 +323,8 @@ func buildProxyPool(ctx context.Context, configs []ProxyConfig) error {
 func checkProxyHealth(ctx context.Context, instances []*ProxyInstance) {
     for _, p := range instances {
         if !p.Healthy {
-            // Already dead, maybe try to revive after a while
             p.failures++
             if p.failures > 3 {
-                // Mark for removal
                 p.Healthy = false
             }
             continue
@@ -501,7 +503,7 @@ func main() {
                     continue
                 }
                 proxyConfigs = newConfigs
-                buildProxyPool(ctx, proxyConfigs) // rebuild pool
+                buildProxyPool(ctx, proxyConfigs)
             }
         }
     }()

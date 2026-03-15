@@ -20,6 +20,7 @@ import (
 
     "github.com/greysquirr3l/lashes"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
+    "github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
 // ========== CONFIGURATION ==========
@@ -33,7 +34,7 @@ const (
     localSocksPort  = 1080
 )
 
-// Supported encryption methods
+// Supported encryption methods (from go-shadowsocks2)
 var supportedMethods = map[string]bool{
     "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
     "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
@@ -189,6 +190,7 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
+    // Create cipher
     cipher, err := ss.PickCipher(cfg.Method, nil, cfg.Password)
     if err != nil {
         return nil, fmt.Errorf("cipher error: %w", err)
@@ -222,12 +224,13 @@ func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
     if err != nil {
         return
     }
-    // Connect to remote Shadowsocks server
+    // Connect to remote Shadowsocks server using the correct Dial signature
     remote, err := ss.Dial(remoteAddr, cipher)
     if err != nil {
         return
     }
     defer remote.Close()
+    // Relay traffic
     go func() {
         io.Copy(remote, client)
         if tcpConn, ok := remote.(*net.TCPConn); ok {
@@ -271,28 +274,28 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
     }()
 
     // Create rotator with default config
-    config := lashes.DefaultConfig()
-    config.Strategy = lashes.RoundRobin
-    config.HealthCheck = &lashes.HealthCheckConfig{
+    cfg := lashes.DefaultConfig()
+    cfg.Strategy = lashes.RoundRobinStrategy
+    cfg.HealthCheck = &lashes.HealthCheckConfig{
         Interval: 30 * time.Second,
         Timeout:  5 * time.Second,
         Parallel: 3,
     }
 
-    rot, err := lashes.NewRotator(config)
+    rot, err := lashes.New(cfg)
     if err != nil {
         return nil, err
     }
 
     // Add proxies
     for _, p := range proxyURLs {
-        if err := rot.AddProxy(ctx, p, lashes.SOCKS5); err != nil {
+        if err := rot.Add(ctx, p, lashes.SOCKS5); err != nil {
             log.Printf("Failed to add proxy %s: %v", p, err)
         }
     }
 
     // Start health checks
-    rot.StartHealthChecks(ctx)
+    go rot.HealthCheck(ctx, cfg.HealthCheck)
 
     return rot, nil
 }
@@ -441,7 +444,7 @@ func main() {
         defer ticker.Stop()
         for {
             select {
-            case <-ctx.Done():
+            <-ctx.Done():
                 return
             case <-ticker.C:
                 log.Println("Refreshing proxy list...")

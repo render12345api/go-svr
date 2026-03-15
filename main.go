@@ -18,8 +18,11 @@ import (
     "sync/atomic"
     "time"
 
+    // Register all ciphers
+    _ "github.com/shadowsocks/go-shadowsocks2/aead"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
     "github.com/shadowsocks/go-shadowsocks2/socks"
+    _ "github.com/shadowsocks/go-shadowsocks2/stream"
 )
 
 // ========== CONFIG ==========
@@ -35,6 +38,7 @@ const (
 )
 
 // cipherNameMap translates common Shadowsocks method names to those expected by go-shadowsocks2.
+// Includes both common variations and a fallback to the original.
 var cipherNameMap = map[string]string{
     "aes-128-cfb":              "AES-128-CFB",
     "aes-192-cfb":              "AES-192-CFB",
@@ -50,6 +54,12 @@ var cipherNameMap = map[string]string{
     "chacha20":                 "CHACHA20",
     "rc4-md5":                  "RC4-MD5",
     "salsa20":                  "SALSA20",
+    // Add common uppercase variations just in case
+    "CHACHA20-IETF-POLY1305":   "AEAD_CHACHA20_POLY1305",
+    "AEAD_CHACHA20_POLY1305":   "AEAD_CHACHA20_POLY1305",
+    "AES-256-GCM":              "AEAD_AES_256_GCM",
+    "AES-128-GCM":              "AEAD_AES_128_GCM",
+    "AES-256-CFB":              "AES-256-CFB",
 }
 
 // supportedMethods are the keys we accept from the proxy list.
@@ -218,12 +228,13 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
+    // Try to map the method; if not found, use the original method as fallback
     mappedMethod, ok := cipherNameMap[cfg.Method]
     if !ok {
-        return nil, fmt.Errorf("no mapping for cipher %s", cfg.Method)
+        mappedMethod = cfg.Method // fallback
+        log.Printf("No mapping for %s, trying original", cfg.Method)
     }
 
-    // Debug: log the exact string we're passing to PickCipher
     log.Printf("Attempting cipher: %s → %s", cfg.Method, mappedMethod)
 
     cipher, err := ss.PickCipher(mappedMethod, nil, cfg.Password)

